@@ -1,5 +1,7 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 
 void main() {
@@ -17,6 +19,10 @@ class IPTVApp extends StatelessWidget {
         brightness: Brightness.dark,
         primarySwatch: Colors.blue,
         scaffoldBackgroundColor: const Color(0xFF121212),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF1F1F1F),
+          elevation: 0,
+        ),
       ),
       home: const TelaLogin(),
       debugShowCheckedModeBanner: false,
@@ -26,14 +32,22 @@ class IPTVApp extends StatelessWidget {
 
 // ==================== MODELO DE CANAL ====================
 class CanalModel {
+  final String id;
   final String nome;
   final String logo;
   final String url;
+  final String categoria;
 
-  CanalModel({required this.nome, required this.logo, required this.url});
+  CanalModel({
+    required this.id,
+    required this.nome,
+    required this.logo,
+    required this.url,
+    this.categoria = 'Geral',
+  });
 }
 
-// ==================== PARSER DA LISTA M3U ====================
+// ==================== PARSER M3U & XTREAM ====================
 Future<List<CanalModel>> baixarEProcessarM3U(String urlLista) async {
   try {
     final response = await http.get(Uri.parse(urlLista));
@@ -43,6 +57,7 @@ Future<List<CanalModel>> baixarEProcessarM3U(String urlLista) async {
       final linhas = response.body.split('\n');
       String nome = '';
       String logo = '';
+      String categoria = 'Geral';
 
       for (var linha in linhas) {
         linha = linha.trim();
@@ -55,23 +70,57 @@ Future<List<CanalModel>> baixarEProcessarM3U(String urlLista) async {
             try {
               final startIndex = linha.indexOf('tvg-logo="') + 10;
               final endIndex = linha.indexOf('"', startIndex);
-              if (endIndex != -1) {
-                logo = linha.substring(startIndex, endIndex);
-              }
+              if (endIndex != -1) logo = linha.substring(startIndex, endIndex);
+            } catch (_) {}
+          }
+          if (linha.contains('group-title="')) {
+            try {
+              final startIndex = linha.indexOf('group-title="') + 13;
+              final endIndex = linha.indexOf('"', startIndex);
+              if (endIndex != -1) categoria = linha.substring(startIndex, endIndex);
             } catch (_) {}
           }
         } else if (linha.isNotEmpty && !linha.startsWith('#')) {
           canais.add(CanalModel(
+            id: linha,
             nome: nome.isEmpty ? 'Canal sem nome' : nome,
             logo: logo,
             url: linha,
+            categoria: categoria.isEmpty ? 'Geral' : categoria,
           ));
           nome = '';
           logo = '';
+          categoria = 'Geral';
         }
       }
     }
     return canais;
+  } catch (e) {
+    return [];
+  }
+}
+
+Future<List<CanalModel>> carregarXtreamCodes(String server, String user, String pass) async {
+  try {
+    String cleanServer = server.endsWith('/') ? server.substring(0, server.length - 1) : server;
+    final url = Uri.parse('$cleanServer/player_api.php?username=$user&password=$pass&action=get_live_streams');
+    final response = await http.get(url);
+
+    if (response.statusCode == 200) {
+      List data = json.decode(response.body);
+      return data.map((item) {
+        String streamId = item['stream_id'].toString();
+        String streamUrl = '$cleanServer/live/$user/$pass/$streamId.m3u8';
+        return CanalModel(
+          id: streamId,
+          nome: item['name'] ?? 'Sem nome',
+          logo: item['stream_icon'] ?? '',
+          url: streamUrl,
+          categoria: item['category_name'] ?? 'Geral',
+        );
+      }).toList();
+    }
+    return [];
   } catch (e) {
     return [];
   }
@@ -85,34 +134,57 @@ class TelaLogin extends StatefulWidget {
   State<TelaLogin> createState() => _TelaLoginState();
 }
 
-class _TelaLoginState extends State<TelaLogin> {
-  final _controller = TextEditingController(
-    text: 'https://iptv-org.github.io/iptv/index.m3u', // Lista pública de teste
-  );
+class _TelaLoginState extends State<TelaLogin> with SingleTickerProviderStateMixin {
+  late TabController _tabController;
+  final _urlM3uController = TextEditingController(text: 'https://iptv-org.github.io/iptv/index.m3u');
+  
+  final _serverController = TextEditingController();
+  final _userController = TextEditingController();
+  final _passController = TextEditingController();
+
   bool _carregando = false;
 
-  void _carregarLista() async {
-    String url = _controller.text.trim();
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+  }
+
+  void _entrarM3U() async {
+    String url = _urlM3uController.text.trim();
     if (url.isEmpty) return;
 
     setState(() => _carregando = true);
-
     var canais = await baixarEProcessarM3U(url);
-
     setState(() => _carregando = false);
 
-    if (!mounted) return;
+    _navegarParaCanais(canais);
+  }
 
+  void _entrarXtream() async {
+    String server = _serverController.text.trim();
+    String user = _userController.text.trim();
+    String pass = _passController.text.trim();
+
+    if (server.isEmpty || user.isEmpty || pass.isEmpty) return;
+
+    setState(() => _carregando = true);
+    var canais = await carregarXtreamCodes(server, user, pass);
+    setState(() => _carregando = false);
+
+    _navegarParaCanais(canais);
+  }
+
+  void _navegarParaCanais(List<CanalModel> canais) {
+    if (!mounted) return;
     if (canais.isNotEmpty) {
       Navigator.push(
         context,
-        MaterialPageRoute(
-          builder: (context) => TelaCanais(canais: canais),
-        ),
+        MaterialPageRoute(builder: (context) => TelaPrincipal(todosCanais: canais)),
       );
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Erro ao carregar lista ou lista vazia.')),
+        const SnackBar(content: Text('Falha ao carregar canais. Verifique os dados.')),
       );
     }
   }
@@ -120,83 +192,219 @@ class _TelaLoginState extends State<TelaLogin> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('IPTV - Configurar Lista')),
-      body: Padding(
-        padding: const EdgeInsets.all(24.0),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.tv, size: 80, color: Colors.blueAccent),
-            const SizedBox(height: 20),
-            TextField(
-              controller: _controller,
-              decoration: const InputDecoration(
-                labelText: 'URL da Lista M3U',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.link),
-              ),
-            ),
-            const SizedBox(height: 20),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: ElevatedButton(
-                onPressed: _carregando ? null : _carregarLista,
-                child: _carregando
-                    ? const CircularProgressIndicator(color: Colors.white)
-                    : const Text('Carregar Canais', style: TextStyle(fontSize: 16)),
-              ),
-            ),
+      appBar: AppBar(
+        title: const Text('IPTV Player Pro'),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(text: 'Lista M3U'),
+            Tab(text: 'Xtream API'),
           ],
         ),
       ),
+      body: _carregando
+          ? const Center(child: CircularProgressIndicator())
+          : TabBarView(
+              controller: _tabController,
+              children: [
+                // Aba M3U
+                Padding(
+                  padding: const EdgeInsets.all(20.0),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      TextField(
+                        controller: _urlM3uController,
+                        decoration: const InputDecoration(
+                          labelText: 'URL M3U',
+                          border: OutlineInputBorder(),
+                          prefixIcon: Icon(Icons.link),
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      ElevatedButton(
+                        onPressed: _entrarM3U,
+                        style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(50)),
+                        child: const Text('Carregar Lista'),
+                      ),
+                    ],
+                  ),
+                ),
+                // Aba Xtream Codes
+                Padding(
+                  padding: const EdgeInsets.all(20.0),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      children: [
+                        const SizedBox(height: 20),
+                        TextField(
+                          controller: _serverController,
+                          decoration: const InputDecoration(
+                            labelText: 'URL do Servidor (ex: http://servidor.com:8080)',
+                            border: OutlineInputBorder(),
+                            prefixIcon: Icon(Icons.dns),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _userController,
+                          decoration: const InputDecoration(
+                            labelText: 'Usuário',
+                            border: OutlineInputBorder(),
+                            prefixIcon: Icon(Icons.person),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: _passController,
+                          obscureText: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Senha',
+                            border: OutlineInputBorder(),
+                            prefixIcon: Icon(Icons.lock),
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        ElevatedButton(
+                          onPressed: _entrarXtream,
+                          style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(50)),
+                          child: const Text('Entrar'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
     );
   }
 }
 
-// ==================== TELA DE LISTA DE CANAIS ====================
-class TelaCanais extends StatelessWidget {
-  final List<CanalModel> canais;
+// ==================== TELA PRINCIPAL (CATEGORIAS E FAVORITOS) ====================
+class TelaPrincipal extends StatefulWidget {
+  final List<CanalModel> todosCanais;
 
-  const TelaCanais({super.key, required this.canais});
+  const TelaPrincipal({super.key, required this.todosCanais});
+
+  @override
+  State<TelaPrincipal> createState() => _TelaPrincipalState();
+}
+
+class _TelaPrincipalState extends State<TelaPrincipal> {
+  List<String> _favoritosIds = [];
+  String _categoriaSelecionada = 'Todas';
+
+  @override
+  void initState() {
+    super.initState();
+    _carregarFavoritos();
+  }
+
+  void _carregarFavoritos() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _favoritosIds = prefs.getStringList('favoritos') ?? [];
+    });
+  }
+
+  void _toggleFavorito(String id) async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      if (_favoritosIds.contains(id)) {
+        _favoritosIds.remove(id);
+      } else {
+        _favoritosIds.add(id);
+      }
+    });
+    await prefs.setStringList('favoritos', _favoritosIds);
+  }
 
   @override
   Widget build(BuildContext context) {
+    List<String> categorias = ['Todas', 'Favoritos'];
+    var categoriasM3U = widget.todosCanais.map((c) => c.categoria).toSet().toList();
+    categoriasM3U.sort();
+    categorias.addAll(categoriasM3U);
+
+    List<CanalModel> canaisExibidos = widget.todosCanais.where((canal) {
+      if (_categoriaSelecionada == 'Todas') return true;
+      if (_categoriaSelecionada == 'Favoritos') return _favoritosIds.contains(canal.id);
+      return canal.categoria == _categoriaSelecionada;
+    }).toList();
+
     return Scaffold(
-      appBar: AppBar(title: Text('Canais Disponíveis (${canais.length})')),
-      body: ListView.builder(
-        itemCount: canais.length,
-        itemBuilder: (context, index) {
-          final canal = canais[index];
-          return ListTile(
-            leading: canal.logo.isNotEmpty
-                ? Image.network(
-                    canal.logo,
-                    width: 40,
-                    height: 40,
-                    errorBuilder: (context, error, stackTrace) =>
-                        const Icon(Icons.tv, size: 40),
-                  )
-                : const Icon(Icons.tv, size: 40),
-            title: Text(canal.nome, maxLines: 1, overflow: TextOverflow.ellipsis),
-            subtitle: Text(canal.url, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey)),
-            trailing: const Icon(Icons.play_arrow, color: Colors.green),
-            onTap: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => TelaPlayer(canal: canal),
-                ),
-              );
-            },
-          );
-        },
+      appBar: AppBar(
+        title: Text('Canais (${canaisExibidos.length})'),
+      ),
+      body: Row(
+        children: [
+          Container(
+            width: 140,
+            color: const Color(0xFF1E1E1E),
+            child: ListView.builder(
+              itemCount: categorias.length,
+              itemBuilder: (context, index) {
+                final cat = categorias[index];
+                final selecionado = cat == _categoriaSelecionada;
+                return ListTile(
+                  title: Text(
+                    cat,
+                    style: TextStyle(
+                      color: selecionado ? Colors.blueAccent : Colors.white,
+                      fontWeight: selecionado ? FontWeight.bold : FontWeight.normal,
+                      fontSize: 13,
+                    ),
+                  ),
+                  selected: selecionado,
+                  onTap: () {
+                    setState(() => _categoriaSelecionada = cat);
+                  },
+                );
+              },
+            ),
+          ),
+          Expanded(
+            child: ListView.builder(
+              itemCount: canaisExibidos.length,
+              itemBuilder: (context, index) {
+                final canal = canaisExibidos[index];
+                final ehFavorito = _favoritosIds.contains(canal.id);
+
+                return ListTile(
+                  leading: canal.logo.isNotEmpty
+                      ? Image.network(
+                          canal.logo,
+                          width: 40,
+                          height: 40,
+                          errorBuilder: (_, __, ___) => const Icon(Icons.tv),
+                        )
+                      : const Icon(Icons.tv),
+                  title: Text(canal.nome, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  subtitle: Text(canal.categoria, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  trailing: IconButton(
+                    icon: Icon(
+                      ehFavorito ? Icons.star : Icons.star_border,
+                      color: ehFavorito ? Colors.amber : Colors.grey,
+                    ),
+                    onPressed: () => _toggleFavorito(canal.id),
+                  ),
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => TelaPlayer(canal: canal)),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
-// ==================== TELA DO PLAYER DE VÍDEO ====================
+// ==================== TELA PLAYER DE VÍDEO ====================
 class TelaPlayer extends StatefulWidget {
   final CanalModel canal;
 
@@ -214,20 +422,14 @@ class _TelaPlayerState extends State<TelaPlayer> {
   @override
   void initState() {
     super.initState();
-    _inicializarPlayer();
-  }
-
-  void _inicializarPlayer() {
     _controller = VideoPlayerController.networkUrl(Uri.parse(widget.canal.url))
       ..initialize().then((_) {
         setState(() {
           _inicializado = true;
           _controller.play();
         });
-      }).catchError((error) {
-        setState(() {
-          _erro = true;
-        });
+      }).catchError((_) {
+        setState(() => _erro = true);
       });
   }
 
@@ -240,10 +442,11 @@ class _TelaPlayerState extends State<TelaPlayer> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Colors.black,
       appBar: AppBar(title: Text(widget.canal.nome)),
       body: Center(
         child: _erro
-            ? const Text('Erro ao reproduzir este canal.', style: TextStyle(color: Colors.red, fontSize: 18))
+            ? const Text('Erro ao reproduzir o canal.', style: TextStyle(color: Colors.red))
             : _inicializado
                 ? AspectRatio(
                     aspectRatio: _controller.value.aspectRatio,
